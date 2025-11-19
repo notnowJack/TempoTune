@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Web Instrument Tuner</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="manifest" href="manifest.json">
+
+  <script>
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("/sw.js");
+  }
+  </script>
+
+
+</head>
+<body>
+  <div class="card">
+    <h1>Tuner</h1>
+    
+    <div class="controls">
+      <div class="small">Microphone will start automatically.</div>
+    </div>
+
+    <div class="readout">
+      <div>
+        <div class="note" id="note">—</div>
+        <div class="freq" id="freq">— Hz</div>
+      </div>
+
+      <div class="gauge">
+        <div class="needle-wrap">
+          <canvas id="gauge" width="600" height="120"></canvas>
+        </div>
+        <div class="small cents-center"><span id="cents">—</span> cents</div>
+      </div>
+
+    </div>
+
+    <canvas id="visual" width="800" height="120"></canvas>
+
+    <div class="status" id="status">Idle.</div>
+  </div>
+
+<script>
+// Basic autocorrelation-based pitch detector adapted for browser
+const noteStrings = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+let audioContext, analyser, mediaStreamSource, rafId;
+let bufferLength = 2048; // better results with larger sizes (4096) but slower
+let dataArray;
+let smoothing = 6;
+let refA = 440;
+let stream;
+
+const statusEl = document.getElementById('status');
+const noteEl = document.getElementById('note');
+const freqEl = document.getElementById('freq');
+const centsEl = document.getElementById('cents');
+const gCanvas = document.getElementById('gauge');
+const vCanvas = document.getElementById('visual');
+// `displayModeEl`, `smoothingEl`, `a4El` may be absent after removing controls
+const displayModeEl = document.getElementById('displayMode');
+const smoothingEl = document.getElementById('smoothing');
+const a4El = document.getElementById('a4');
+
+// safe accessor with a fallback value
+const displayMode = { get value(){ return displayModeEl ? displayModeEl.value : 'needle'; } };
+
+const gCtx = gCanvas.getContext('2d');
+const vCtx = vCanvas.getContext('2d');
+
+function updateUI(frequency){
+  if(!frequency || frequency <= 0){
+    noteEl.textContent = '—'; freqEl.textContent = '— Hz'; centsEl.textContent = '—';
+    drawGauge(null);
+    return;
+  }
+  const noteNum = 12 * (Math.log(frequency / refA) / Math.log(2)) + 69; // MIDI note number
+  const rounded = Math.round(noteNum);
+  const noteName = noteStrings[(rounded + 3) % 12]; // MIDI note 69 is A4 -> index 9 -> offset +3 to map
+  const octave = Math.floor((rounded / 12) - 1);
+  const noteLabel = noteName + octave;
+  const cents = Math.floor((noteNum - rounded) * 100);
+  noteEl.textContent = noteLabel;
+  freqEl.textContent = frequency.toFixed(2) + ' Hz';
+  centsEl.textContent = (cents > 0 ? '+'+cents : cents);
+  drawGauge(cents);
+}
+
+function drawGauge(cents){
+  const w = gCanvas.width; const h = gCanvas.height;
+  gCtx.clearRect(0,0,w,h);
+  // background arc
+  gCtx.save();
+  gCtx.translate(w/2,h);
+  gCtx.lineWidth = 8;
+  gCtx.beginPath();
+  gCtx.arc(0,0,Math.min(w/2 - 30, h*0.9), Math.PI, 0, false);
+  gCtx.strokeStyle = 'rgba(255,255,255,0.06)';
+  gCtx.stroke();
+  // ticks
+  for(let i=-50;i<=50;i+=10){
+    const ang = Math.PI - (i+50)/100*Math.PI;
+    const rOut = Math.min(w/2 - 30, h*0.9);
+    const rIn = rOut - (i%50==0?18:10);
+    gCtx.beginPath(); gCtx.moveTo(Math.cos(ang)*rIn, Math.sin(ang)*rIn*-1);
+    gCtx.lineTo(Math.cos(ang)*rOut, Math.sin(ang)*rOut*-1);
+    gCtx.strokeStyle = 'rgba(255,255,255,0.08)'; gCtx.lineWidth = 2; gCtx.stroke();
+  }
+  // needle
+  if(cents !== null && cents !== undefined){
+    const value = Math.max(-50, Math.min(50, cents));
+    const ang = Math.PI - (value+50)/100*Math.PI;
+    const r = Math.min(w/2 - 40, h*0.85);
+    gCtx.beginPath(); gCtx.moveTo(0,0);
+    gCtx.lineTo(Math.cos(ang)*r, Math.sin(ang)*r*-1);
+    gCtx.strokeStyle = 'rgba(125,211,252,1)'; gCtx.lineWidth = 3; gCtx.stroke();
+    // center dot
+    gCtx.beginPath(); gCtx.arc(0,0,6,0,Math.PI*2); gCtx.fillStyle = 'rgba(125,211,252,1)'; gCtx.fill();
+  }
+  gCtx.restore();
+}
+
+function autoCorrelate(buf, sampleRate) {
+  // Implementation adapted from Chris Wilson's auto-correlation
+  const SIZE = buf.length;
+  let rms = 0;
+  for (let i = 0; i < SIZE; i++) {
+    const val = buf[i]; rms += val * val;
+  }
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < 0.01) // too quiet
+    return -1;
+
+  let r1 = 0, r2 = SIZE - 1, thres = 0.2;
+  for (let i = 0; i < SIZE / 2; i++) {
+    if (Math.abs(buf[i]) < thres) { r1 = i; break; }
+  }
+  for (let i = 1; i < SIZE / 2; i++) {
+    if (Math.abs(buf[SIZE - i]) < thres) { r2 = SIZE - i; break; }
+  }
+
+  buf = buf.slice(r1, r2);
+  const newSize = buf.length;
+
+  const c = new Array(newSize).fill(0);
+  for (let i = 0; i < newSize; i++) {
+    for (let j = 0; j < newSize - i; j++) {
+      c[i] = c[i] + buf[j] * buf[j + i];
+    }
+  }
+  let d = 0; while (c[d] > c[d+1]) d++;
+  let maxval = -1, maxpos = -1;
+  for (let i = d; i < newSize; i++) {
+    if (c[i] > maxval) { maxval = c[i]; maxpos = i; }
+  }
+  let T0 = maxpos;
+  if (!T0) return -1;
+  // interpolation
+  const x1 = c[T0 - 1], x2 = c[T0], x3 = c[T0 + 1];
+  const a = (x1 + x3 - 2 * x2) / 2;
+  const b = (x3 - x1) / 2;
+  if (a) T0 = T0 - b / (2 * a);
+  return sampleRate / T0;
+}
+
+function smoothFrequency(prev, current, s){
+  if(!prev) return current;
+  const alpha = Math.max(0.05, Math.min(1, s/10));
+  return prev * (1 - alpha) + current * alpha;
+}
+
+let lastFreq = null;
+
+async function start(){
+  try{
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      statusEl.textContent = 'getUserMedia not supported in this browser.'; return;
+    }
+    stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    mediaStreamSource = audioContext.createMediaStreamSource(stream);
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 4096;
+    bufferLength = analyser.fftSize;
+    dataArray = new Float32Array(bufferLength);
+    mediaStreamSource.connect(analyser);
+    statusEl.textContent = 'Listening...';
+    tick();
+  }catch(err){
+    console.error(err); statusEl.textContent = 'Microphone access denied or error: '+err.message;
+  }
+}
+
+function stop(){
+  if(rafId) cancelAnimationFrame(rafId);
+  if(stream){
+    stream.getTracks().forEach(t=>t.stop()); stream = null;
+  }
+  if(audioContext){ audioContext.close(); audioContext = null; }
+  statusEl.textContent = 'Stopped.';
+  noteEl.textContent = '—'; freqEl.textContent = '— Hz'; centsEl.textContent = '—';
+  vCtx.clearRect(0,0,vCanvas.width,vCanvas.height); drawGauge(null);
+}
+
+function tick(){
+  analyser.getFloatTimeDomainData(dataArray);
+  // draw waveform if asked
+  if(displayMode.value === 'wave') drawWaveform(dataArray);
+  const freq = autoCorrelate(dataArray, audioContext.sampleRate);
+  const s = smoothingEl && smoothingEl.value ? Number(smoothingEl.value) : 6;
+  refA = a4El && a4El.value ? Number(a4El.value) : refA;
+  if(freq && freq !== -1 && freq < 5000){
+    lastFreq = smoothFrequency(lastFreq, freq, s);
+    updateUI(lastFreq);
+  } else {
+    // slowly decay
+    lastFreq = lastFreq ? lastFreq*0.995 : null;
+    updateUI(lastFreq);
+  }
+  rafId = requestAnimationFrame(tick);
+}
+
+function drawWaveform(buf){
+  const w = vCanvas.width, h = vCanvas.height;
+  vCtx.clearRect(0,0,w,h);
+  vCtx.beginPath();
+  const step = Math.ceil(buf.length / w);
+  let x = 0;
+  for(let i=0;i<w;i++){
+    const v = buf[i*step] ?? 0;
+    const y = (1+v)/2 * h;
+    if(i===0) vCtx.moveTo(x,y); else vCtx.lineTo(x,y);
+    x+=1;
+  }
+  vCtx.strokeStyle = 'rgba(125,211,252,0.9)'; vCtx.lineWidth = 1.5; vCtx.stroke();
+}
+
+// Auto-start listening on load
+// Note: this will prompt the user for microphone permission when the page loads
+
+if (smoothingEl) {
+  smoothingEl.addEventListener('input', ()=>{
+    // smoothing read each tick; listener kept for compatibility
+  });
+}
+
+if (a4El) {
+  a4El.addEventListener('change', ()=>{ refA = Number(a4El.value); });
+}
+
+if (displayModeEl) {
+  displayModeEl.addEventListener('change', ()=>{
+    if(displayMode.value==='needle') vCtx.clearRect(0,0,vCanvas.width,vCanvas.height);
+  });
+}
+
+// initialize visuals
+drawGauge(null);
+
+// Start listening immediately
+start();
+
+</script>
+</body>
+</html>
