@@ -1,17 +1,17 @@
 {
   "name": "TempoTune",
-  "start_url": "/index.html",
-  "display": "standalone",
   "icons": [
     {
-      "src": "./icons/BEAN.png",
-      "sizes": "192x192",
-      "type": "image/png"
+      "src": "icons/BEAN.jpg",
+      "type": "image/jpg",
+      "sizes": "512x512"
     },
     {
-      "src": "./icons/BEAN.jpg",
-      "sizes": "512x512",
-      "type": "image/jpg"
+        "src": "icons/BEAN.png",
+        "type": "image/png",
+        "sizes": "192x192"
     }
-  ]
+  ],
+  "start_url" : "./",
+  "display": "standalone"
 }
